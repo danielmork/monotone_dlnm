@@ -37,3 +37,9 @@ vignettes/*.pdf
 
 # R Environment Variables
 .Renviron
+
+# sim files
+sim.ts.out/*.rda
+chicago*/*
+img/*
+*.Rproj
