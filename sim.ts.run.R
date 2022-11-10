@@ -9,25 +9,21 @@ library(ggplot2)
 library(tables)
 source("ts.dlnm.R")
 
-restarts <- 10
-nsims <- 50
+restarts <- 20
+nsims <- 100
 
-cl <- makeCluster(6, "FORK")
+cl <- makeCluster(47, "FORK")
 registerDoParallel(cl)
 getDoParWorkers()
 
-for (erc in c("linear", "exponential", "sublinear")) {
-  for (trc in c("quadratic", "exponential", "piecewise")) {
-    for (n in c(500)) {
-      cat(erc, trc, n, "\n")
-      ret <- foreach(sim.num = 1:nsims,
-                     .export = c("erc", "trc", "n", "restarts", "ts.dlnm"),
-                     .verbose = FALSE) %dopar% {
-        source("sim.ts.R", local = TRUE)
-      }
-    }
-  }
-}
+ret <- foreach(erc = c("linear", "exponential", "sublinear")) %:%
+  foreach(trc = c("quadratic", "exponential", "piecewise")) %:%
+  foreach(n = c(500)) %:%
+  foreach(sim.num = 1:nsims, 
+          .errorhandling = "remove", 
+          .combine = cbind,
+          .export = c("restarts", "ts.dlnm"),
+          .verbose = FALSE) %dopar% source("sim.ts.R", local = TRUE)
 stopCluster(cl)
 
 
@@ -105,6 +101,7 @@ for (erc in c("linear", "exponential", "sublinear")) {
     }
   }
 }
+save(res, file = "sim_results.rda")
 
 res <- res %>%
   mutate(prec = tp / (tp + fp),

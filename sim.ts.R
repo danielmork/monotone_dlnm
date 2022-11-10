@@ -1,3 +1,4 @@
+# devtools::install_github("danielmork/dlmtree", ref = "mono_var_select_logit")
 library(dlnm)
 library(data.table)
 library(dlmtree)
@@ -96,10 +97,10 @@ sim$metrics[[m_name]] <- list(
 ##### Monotone-TDLNM informative priors #####
 m_name <- "tdlnmvs_ip"
 truth_lags <- which(colSums(truth > 0) > 0)
-zirtp0 <- rep(0.5, lags + 1)
+zirtp0 <- rep(0.1, lags + 1)
 zirtp0[truth_lags] <- 0.9
 ts0 <- rep(1, lags)
-ts0[c(1, truth_lags)] <- 10
+ts0[c(1, truth_lags, max(truth_lags) + 1)] <- 10
 
 mlist <- list()
 for (i in 1:restarts) {
@@ -111,7 +112,7 @@ for (i in 1:restarts) {
                       exposure.splits = temp_splits,
                       exposure.se = se,
                       n.trees = ntrees, n.burn = nburn, n.iter = niter, n.thin = nthin,
-                      shrinkage = 0, zirt.p0 = zirtp0, zirt.p0.strength = 2,
+                      shrinkage = 0, zirt.p0 = zirtp0, zirt.p0.strength = 5,
                       tree.time.split.params = ts0,
                       monotone = T, verbose = F)
 }
@@ -163,7 +164,7 @@ sim$metrics[[m_name]] <- list(
 m_name <- "tdlnm_ip"
 truth_lags <- which(colSums(truth > 0) > 0)
 ts0 <- rep(1, lags)
-ts0[c(1,truth_lags)] <- 10
+ts0[c(1, truth_lags, max(truth_lags) + 1)] <- 10
 mlist <- list()
 for (i in 1:restarts) {
   # cat(".")
