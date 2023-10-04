@@ -17,12 +17,13 @@ ts.dlnm <- function(erc = "exponential", # also, sublinear, exponential
     erc_fun <- function(x) 1
   }
 
+
   if (trc == "piecewise") {
     trc_fun <- function(t) ifelse(t < 4, 20, 0)
-  } else if (trc == "exponential") {
-    trc_fun <- function(t) ifelse(t < 4, (exp(4 - t) - 1), 0)
+  } else if (trc == "linear") {
+    trc_fun <- function(t) ifelse(t < 6, 6 * (6 - t), 0)
   } else if (trc == "quadratic") {
-    trc_fun <- function(t) ifelse(t <= 6, 0.75 * ((t - 6) ^ 2) * (t), 0)
+    trc_fun <- function(t) ifelse(t <= 8, 0.2 * ((t - 8) ^ 2) * (t + 1), 0)
   } else if (trc == "identity") {
     trc_fun <- function(x) 1
   }

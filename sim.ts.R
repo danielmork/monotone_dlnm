@@ -1,39 +1,14 @@
-# devtools::install_github("danielmork/dlmtree", ref = "mono_var_select_logit")
 library(dlnm)
 library(data.table)
 library(dlmtree)
 library(mgcv)
-# source("sim/ts.dlnm.R")
-combine_models <- function(mlist) {
-  out <- mlist[[1]]
-  iter <- out$mcmcIter
-  out$DLM <- do.call(rbind, lapply(1:length(mlist), function(i) {
-    d <- mlist[[i]]$DLM
-    d$Iter <- d$Iter + (i - 1) * iter
-    d
-  }))
-  out$mcmcIter <- mlist[[1]]$mcmcIter * length(mlist)
-  out$nIter <- mlist[[1]]$nIter * length(mlist)
-  colnames(out$DLM) <- colnames(mlist[[1]]$DLM)
-  out$sigma2 <- do.call(c, lapply(mlist, function(l) l$sigma2))
-  out$kappa <- do.call(c, lapply(mlist, function(l) l$kappa))
-  out$nu <- do.call(c, lapply(mlist, function(l) l$nu))
-  out$tau <- do.call(rbind, lapply(mlist, function(l) l$tau))
-  out$termNodes <- do.call(rbind, lapply(mlist, function(l) l$termNodes))
-  out$gamma <- do.call(rbind, lapply(mlist, function(l) l$gamma))
-  out$zirt <- do.call(rbind, lapply(mlist, function(l) l$zirt))
-  out$zirtCov <- do.call(rbind, lapply(mlist, function(l) l$zirtCov))
-  out$timeProbs <- do.call(rbind, lapply(mlist, function(l) l$timeProbs))
-  out$timeCounts <- do.call(rbind, lapply(mlist, function(l) l$timeCounts))
-  out$sigma2 <- do.call(c, lapply(mlist, function(l) l$sigma2))
-  return(out)
-}
+library(coda)
 
 
 ##### Sim setup #####
 set.seed(sim.num)
 nburn <- 2000
-niter <- 2000
+niter <- 5000
 ntrees <- 20
 nthin <- 10
 lags <- 20
@@ -53,7 +28,7 @@ cols <- paste0("temp.", 0:lags)
 f <- colSums(sapply(1:n, function(i) dlnm(as.numeric(dat[i, ..cols]), 0:lags)))
 truth <- sapply(0:lags, function(t) dlnm(eval.erc.grid, t))
 sim$truth <- truth
-dat$y <- f + rnorm(n, 0, 1.7 * sd(f))
+dat$y <- f + rnorm(n, 0, error * sd(f))
 cor(dat$y, f)
 sim[['cor']] <- cor(dat$y, f)
 cols <- paste0("temp.", 0:lags)
@@ -65,9 +40,12 @@ out_trans <- function(x) x
 
 
 
+
+
 ##### Monotone-TDLNM #####
-m_name <- "tdlnmvs"
+m_name <- "m-tdlnm"
 mlist <- list()
+s0 <- diag(lags + 1) * 0.561^2
 for (i in 1:restarts) {
   # cat(".")
   set.seed(i)
@@ -77,30 +55,49 @@ for (i in 1:restarts) {
                       exposure.splits = temp_splits,
                       exposure.se = se,
                       n.trees = ntrees, n.burn = nburn, n.iter = niter, n.thin = nthin,
-                      shrinkage = 0,
+                      monotone.sigma = s0, altmcmc = 1,
                       monotone = T, verbose = F)
 }
-sim$mod[[m_name]] <- combine_models(mlist)
-sim$summary[[m_name]] <- summary(sim$mod[[m_name]], cenval = cen, pred.at = eval.erc.grid, verbose = F, conf.level = 0.95)
+sim$mod[[m_name]] <- combine.models(mlist)
+sim$summary[[m_name]] <- summary(sim$mod[[m_name]], cenval = cen,
+                                 pred.at = eval.erc.grid, verbose = F,
+                                 conf.level = 0.95)
 sim$summary[[m_name]]$matfit <- out_trans(sim$summary[[m_name]]$matfit)
 sim$summary[[m_name]]$cilower <- out_trans(sim$summary[[m_name]]$cilower)
 sim$summary[[m_name]]$ciupper <- out_trans(sim$summary[[m_name]]$ciupper)
+s <- lapply(mlist, summary, pred.at = eval.erc.grid, verbose = F, mcmc = T)
+s_mcmc <- do.call(
+  mcmc.list,
+  lapply(1:restarts, function(i) {
+    d <- as.data.table(as.data.frame.table(s[[i]]$dlm_mcmc))
+    mcmc(dcast(d, Var3 ~ Var1 + Var2, value.var = "Freq")[, Var3 := NULL][])
+  })
+)
+sim$summary[[m_name]]$gelman_rubin <- gelman.diag(s_mcmc, autoburnin = F, multivariate = F)
+
 sim$metrics[[m_name]] <- list(
   bias = sim$summary[[m_name]]$matfit - truth,
   mse = (sim$summary[[m_name]]$matfit - truth)^2,
-  cov = mean((sim$summary[[m_name]]$cilower - 0.01 <= truth) & (sim$summary[[m_name]]$ciupper + 0.01 >= truth)),
+  cov = mean((sim$summary[[m_name]]$cilower - 0.05 <= truth) & (sim$summary[[m_name]]$ciupper + 0.05 >= truth)),
   tp = sum((colSums(truth > 0) > 0) & (sim$summary[[m_name]]$splitProb >= 0.95)) / sum(colSums(truth > 0) > 0),
   tn = sum((colSums(truth > 0) == 0) & (sim$summary[[m_name]]$splitProb < 0.95)) / sum(colSums(truth > 0) == 0),
   fp = sum((colSums(truth > 0) == 0) & (sim$summary[[m_name]]$splitProb) >= 0.95) / sum(colSums(truth > 0) == 0),
-  fn = sum((colSums(truth > 0) > 0) & (sim$summary[[m_name]]$splitProb < 0.95)) / sum(colSums(truth > 0) > 0))
+  fn = sum((colSums(truth > 0) > 0) & (sim$summary[[m_name]]$splitProb < 0.95)) / sum(colSums(truth > 0) > 0),
+  convergence_gr = median(sim$summary[[m_name]]$gelman_rubin$psrf[, 1], na.rm = T))
+
+
 
 ##### Monotone-TDLNM informative priors #####
-m_name <- "tdlnmvs_ip"
+m_name <- "m-tdlnm_ip"
 truth_lags <- which(colSums(truth > 0) > 0)
-zirtp0 <- rep(0.1, lags + 1)
-zirtp0[truth_lags] <- 0.9
+g0 <- rep(0, lags + 1) # prior prob 0.005-0.995
+g0[truth_lags] <- 4.119 # prior prob 0.95-0.995
+s0 <- diag(lags + 1) * 2.701^2
+for (s in truth_lags)
+  s0[s, s] <- 0.599^2
 ts0 <- rep(1, lags)
-ts0[c(1, truth_lags, max(truth_lags) + 1)] <- 10
+ts0[truth_lags] <- 10
+ts0 <- ts0 / sum(ts0)
 
 mlist <- list()
 for (i in 1:restarts) {
@@ -112,23 +109,38 @@ for (i in 1:restarts) {
                       exposure.splits = temp_splits,
                       exposure.se = se,
                       n.trees = ntrees, n.burn = nburn, n.iter = niter, n.thin = nthin,
-                      shrinkage = 0, zirt.p0 = zirtp0, zirt.p0.strength = 5,
-                      tree.time.split.params = ts0,
+                      monotone.gamma0 = g0, monotone.sigma = s0,
+                      time.split.prob = ts0, altmcmc = 1,
                       monotone = T, verbose = F)
 }
-sim$mod[[m_name]] <- combine_models(mlist)
-sim$summary[[m_name]] <- summary(sim$mod[[m_name]], cenval = cen, pred.at = eval.erc.grid, verbose = F, conf.level = 0.95)
+sim$mod[[m_name]] <- combine.models(mlist)
+sim$summary[[m_name]] <- summary(sim$mod[[m_name]], cenval = cen,
+                                 pred.at = eval.erc.grid, verbose = F,
+                                 conf.level = 0.95)
 sim$summary[[m_name]]$matfit <- out_trans(sim$summary[[m_name]]$matfit)
 sim$summary[[m_name]]$cilower <- out_trans(sim$summary[[m_name]]$cilower)
 sim$summary[[m_name]]$ciupper <- out_trans(sim$summary[[m_name]]$ciupper)
+s <- lapply(mlist, summary, pred.at = eval.erc.grid, verbose = F, mcmc = T)
+s_mcmc <- do.call(
+  mcmc.list,
+  lapply(1:restarts, function(i) {
+    d <- as.data.table(as.data.frame.table(s[[i]]$dlm_mcmc))
+    mcmc(dcast(d, Var3 ~ Var1 + Var2, value.var = "Freq")[, Var3 := NULL][])
+  })
+)
+sim$summary[[m_name]]$gelman_rubin <- gelman.diag(s_mcmc, autoburnin = F, multivariate = F)
+
 sim$metrics[[m_name]] <- list(
   bias = sim$summary[[m_name]]$matfit - truth,
   mse = (sim$summary[[m_name]]$matfit - truth)^2,
-  cov = mean((sim$summary[[m_name]]$cilower - 0.01 <= truth) & (sim$summary[[m_name]]$ciupper + 0.01 >= truth)),
+  cov = mean((sim$summary[[m_name]]$cilower - 0.05 <= truth) & (sim$summary[[m_name]]$ciupper + 0.05 >= truth)),
   tp = sum((colSums(truth > 0) > 0) & (sim$summary[[m_name]]$splitProb >= 0.95)) / sum(colSums(truth > 0) > 0),
   tn = sum((colSums(truth > 0) == 0) & (sim$summary[[m_name]]$splitProb < 0.95)) / sum(colSums(truth > 0) == 0),
   fp = sum((colSums(truth > 0) == 0) & (sim$summary[[m_name]]$splitProb) >= 0.95) / sum(colSums(truth > 0) == 0),
-  fn = sum((colSums(truth > 0) > 0) & (sim$summary[[m_name]]$splitProb < 0.95)) / sum(colSums(truth > 0) > 0))
+  fn = sum((colSums(truth > 0) > 0) & (sim$summary[[m_name]]$splitProb < 0.95)) / sum(colSums(truth > 0) > 0),
+  convergence_gr = median(sim$summary[[m_name]]$gelman_rubin$psrf[, 1], na.rm = T))
+
+
 
 
 #### TDLNM #####
@@ -136,20 +148,31 @@ m_name <- "tdlnm"
 mlist <- list()
 for (i in 1:restarts) {
   # cat(".")
-  set.seed(i)
+  set.seed(i * 100)
   mlist[[i]] <- tdlnm(y ~ 1,
                       data = dat,
                       exposure.data = temp_dat,
                       exposure.splits = temp_splits,
                       exposure.se = se,
-                      n.trees = ntrees, n.burn = nburn, n.iter = niter, n.thin = nthin,
+                      n.trees = 20, n.burn = nburn, n.iter = niter, n.thin = nthin,
                       verbose = F)
 }
-sim$mod[[m_name]] <- combine_models(mlist)
-sim$summary[[m_name]] <- summary(sim$mod[[m_name]], cenval = cen, pred.at = eval.erc.grid, verbose = F)
+sim$mod[[m_name]] <- combine.models(mlist)
+sim$summary[[m_name]] <- summary(sim$mod[[m_name]], cenval = cen,
+                                 pred.at = eval.erc.grid, verbose = F)
 sim$summary[[m_name]]$matfit <- out_trans(sim$summary[[m_name]]$matfit)
 sim$summary[[m_name]]$cilower <- out_trans(sim$summary[[m_name]]$cilower)
 sim$summary[[m_name]]$ciupper <- out_trans(sim$summary[[m_name]]$ciupper)
+s <- lapply(mlist, summary, pred.at = eval.erc.grid, verbose = F, mcmc = T)
+s_mcmc <- do.call(
+  mcmc.list,
+  lapply(1:restarts, function(i) {
+    d <- as.data.table(as.data.frame.table(s[[i]]$dlm_mcmc))
+    mcmc(dcast(d, Var3 ~ Var1 + Var2, value.var = "Freq")[, Var3 := NULL][])
+  })
+)
+sim$summary[[m_name]]$gelman_rubin <- gelman.diag(s_mcmc, autoburnin = F, multivariate = F)
+
 sim$metrics[[m_name]] <- list(
   bias = (sim$summary[[m_name]]$matfit - truth),
   mse = ((sim$summary[[m_name]]$matfit - truth)^2),
@@ -157,31 +180,45 @@ sim$metrics[[m_name]] <- list(
   tp = sum((colSums(truth > 0) > 0) & (colSums(sim$summary[[m_name]]$cilower > 0 | sim$summary[[m_name]]$ciupper < 0) > 0)) / sum(colSums(truth > 0) > 0),
   tn = sum((colSums(truth > 0) == 0) & (colSums(sim$summary[[m_name]]$cilower > 0 | sim$summary[[m_name]]$ciupper < 0) == 0)) / sum(colSums(truth > 0) == 0),
   fp = sum((colSums(truth > 0) == 0) & (colSums(sim$summary[[m_name]]$cilower > 0 | sim$summary[[m_name]]$ciupper < 0) > 0)) / sum(colSums(truth > 0) == 0),
-  fn = sum((colSums(truth > 0) > 0) & (colSums(sim$summary[[m_name]]$cilower > 0 | sim$summary[[m_name]]$ciupper < 0) == 0)) / sum(colSums(truth > 0) > 0))
-
-
-##### TDLNM informative prior #####
+  fn = sum((colSums(truth > 0) > 0) & (colSums(sim$summary[[m_name]]$cilower > 0 | sim$summary[[m_name]]$ciupper < 0) == 0)) / sum(colSums(truth > 0) > 0),
+  convergence_gr = median(sim$summary[[m_name]]$gelman_rubin$psrf[, 1], na.rm = T))
+#
+#
+# ##### TDLNM informative prior #####
 m_name <- "tdlnm_ip"
 truth_lags <- which(colSums(truth > 0) > 0)
 ts0 <- rep(1, lags)
-ts0[c(1, truth_lags, max(truth_lags) + 1)] <- 10
+ts0[truth_lags] <- 10
+ts0 <- ts0 / sum(ts0)
 mlist <- list()
 for (i in 1:restarts) {
   # cat(".")
-  set.seed(i)
+  set.seed(i * 100)
   mlist[[i]] <- tdlnm(y ~ 1,
                       data = dat,
                       exposure.data = temp_dat,
                       exposure.splits = temp_splits,
                       exposure.se = se,
-                      n.trees = ntrees, n.burn = nburn, n.iter = niter, n.thin = nthin,
-                      verbose = F, tree.time.split.params = ts0)
+                      n.trees = 20, n.burn = nburn, n.iter = niter, n.thin = nthin,
+                      time.split.prob = ts0,
+                      verbose = F)
 }
-sim$mod[[m_name]] <- combine_models(mlist)
-sim$summary[[m_name]] <- summary(sim$mod[[m_name]], cenval = cen, pred.at = eval.erc.grid, verbose = F)
+sim$mod[[m_name]] <- combine.models(mlist)
+sim$summary[[m_name]] <- summary(sim$mod[[m_name]], cenval = cen,
+                                 pred.at = eval.erc.grid, verbose = F)
 sim$summary[[m_name]]$matfit <- out_trans(sim$summary[[m_name]]$matfit)
 sim$summary[[m_name]]$cilower <- out_trans(sim$summary[[m_name]]$cilower)
 sim$summary[[m_name]]$ciupper <- out_trans(sim$summary[[m_name]]$ciupper)
+s <- lapply(mlist, summary, pred.at = eval.erc.grid, verbose = F, mcmc = T)
+s_mcmc <- do.call(
+  mcmc.list,
+  lapply(1:restarts, function(i) {
+    d <- as.data.table(as.data.frame.table(s[[i]]$dlm_mcmc))
+    mcmc(dcast(d, Var3 ~ Var1 + Var2, value.var = "Freq")[, Var3 := NULL][])
+  })
+)
+sim$summary[[m_name]]$gelman_rubin <- gelman.diag(s_mcmc, autoburnin = F, multivariate = F)
+
 sim$metrics[[m_name]] <- list(
   bias = (sim$summary[[m_name]]$matfit - truth),
   mse = ((sim$summary[[m_name]]$matfit - truth)^2),
@@ -189,7 +226,8 @@ sim$metrics[[m_name]] <- list(
   tp = sum((colSums(truth > 0) > 0) & (colSums(sim$summary[[m_name]]$cilower > 0 | sim$summary[[m_name]]$ciupper < 0) > 0)) / sum(colSums(truth > 0) > 0),
   tn = sum((colSums(truth > 0) == 0) & (colSums(sim$summary[[m_name]]$cilower > 0 | sim$summary[[m_name]]$ciupper < 0) == 0)) / sum(colSums(truth > 0) == 0),
   fp = sum((colSums(truth > 0) == 0) & (colSums(sim$summary[[m_name]]$cilower > 0 | sim$summary[[m_name]]$ciupper < 0) > 0)) / sum(colSums(truth > 0) == 0),
-  fn = sum((colSums(truth > 0) > 0) & (colSums(sim$summary[[m_name]]$cilower > 0 | sim$summary[[m_name]]$ciupper < 0) == 0)) / sum(colSums(truth > 0) > 0))
+  fn = sum((colSums(truth > 0) > 0) & (colSums(sim$summary[[m_name]]$cilower > 0 | sim$summary[[m_name]]$ciupper < 0) == 0)) / sum(colSums(truth > 0) > 0),
+  convergence_gr = median(sim$summary[[m_name]]$gelman_rubin$psrf[, 1], na.rm = T))
 
 
 
@@ -240,4 +278,5 @@ sim$metrics[[m_name]] <- list(
 
 
 sim$mod <- NULL
-save(sim, file = paste0("sim.ts.out/", erc, ".", trc, ".", n, ".", sim.num, ".rda"))
+save(sim, file = paste0("sim.ts.out.newMCMC/", erc, ".", trc, ".", n, ".", error,
+                        ".", sim.num, ".rda"))

@@ -1,7 +1,7 @@
 ---
 title: "Monotone TDLNM"
 author: "Daniel Mork, Harvard T.H. Chan School of Public Health"
-date: 'Nov. 1, 2022'
+date: 'Aug 15, 2023'
 output:
   html_document:
     theme: lumen
@@ -10,57 +10,40 @@ output:
     toc_float: yes
 ---
 
-```{r setup}
+```{r setup, include=FALSE}
 knitr::opts_chunk$set(echo = TRUE)
-library(dlnm)
-library(mgcv)
 #### Use to install dlmtree package ####
 # library(devtools)
-# install_github("daniel_mork/dlmtree", ref = "mono_var_select_logit")
+# install_github("daniel_mork/dlmtree", ref = "development")
+library(dlnm)
+library(mgcv)
 library(dlmtree)
 library(data.table)
 library(ggplot2)
 library(parallel)
 library(doParallel)
 library(foreach)
-cl <- makeCluster(6, "PSOCK")
-registerDoParallel(cl)
-getDoParWorkers()
+library(coda)
 
-# Function to combine multiple MCMC runs
-restarts <- 10
-combine_models <- function(mlist) {
-  out <- mlist[[1]]
-  iter <- out$mcmcIter
-  out$DLM <- do.call(rbind, lapply(1:length(mlist), function(i) {
-    d <- mlist[[i]]$DLM
-    d$Iter <- d$Iter + (i - 1) * iter
-    d
-  }))
-  out$mcmcIter <- mlist[[1]]$mcmcIter * length(mlist)
-  out$nIter <- mlist[[1]]$nIter * length(mlist)
-  colnames(out$DLM) <- colnames(mlist[[1]]$DLM)
-  out$sigma2 <- do.call(c, lapply(mlist, function(l) l$sigma2))
-  out$kappa <- do.call(c, lapply(mlist, function(l) l$kappa))
-  out$nu <- do.call(c, lapply(mlist, function(l) l$nu))
-  out$tau <- do.call(rbind, lapply(mlist, function(l) l$tau))
-  out$termNodes <- do.call(rbind, lapply(mlist, function(l) l$termNodes))
-  out$gamma <- do.call(rbind, lapply(mlist, function(l) l$gamma))
-  out$zirtGamma <- do.call(rbind, lapply(mlist, function(l) l$zirtGamma))
-  out$timeProbs <- do.call(rbind, lapply(mlist, function(l) l$timeProbs))
-  out$zirtSplitCounts <- do.call(rbind, lapply(mlist, function(l) l$zirtSplitCounts))
-  out$sigma2 <- do.call(c, lapply(mlist, function(l) l$sigma2))
-  return(out)
-}
+# Markov chain specifications
+restarts <- 5
+burn <- 2000
+iter <- 5000
+trees <- 20
+
+# Use multicore to run multiple chains in parallel
+cl <- makeCluster(min(restarts, 6), "FORK")
+registerDoParallel(cl)
+
+# Coefficient transformation
 out_trans <- function(x) 100*(exp(x) - 1)
-set.seed(123)
 ```
 
 
 ## Create lagged data
 We create a lagged dataset with current exposures and exposures from 20 days prior. We differentiate the dataset to model summer (May-Sept) and winter (Oct-Apr) separately because very cold and very warm temperatures are expected to both have detrimental effects on health and we wish to model a monotone effect.
 
-As death counts are large, we assume deaths to be a continuous variable and use a standard linear model framework. We control for time using an interaction between year and month as well as day of week. We compare three methods: monotone TDLNM, standard TDLNM, and penalized spline DLNM.
+As death counts are large, we assume log-death rate to be a continuous variable under a standard linear model framework. We control for time using an interaction between year and month as well as day of week. We compare three methods: Monotone-TDLNM, TDLNM, and GAM under a penalized spline DLNM framework.
 
 ```{r data}
 data("chicagoNMMAPS")
@@ -70,84 +53,139 @@ chicagoNMMAPS[, paste0("temp.", 0:lags) := shift(temp, 0:lags, type = "lag")]
 cols <- c("death", "month", "year", "dow", paste0("temp.", 0:lags))
 data <- chicagoNMMAPS[complete.cases(chicagoNMMAPS[, ..cols])]
 data$logdeath <- log(data$death)
+par(mfrow = c(1, 2))
+hist(data$death, xlab = "Daily deaths", main = "")
 hist(data$logdeath, xlab = "Log daily deaths", main = "")
-summer_data <- data[month > 4 & month < 10]
-winter_data <- data[month < 5 | month > 9]
 cols <- paste0("temp.", 0:lags)
+
+# Summer data
+summer_data <- data[month > 4 & month < 10]
 summer_temp_dat <- as.matrix(summer_data[, ..cols])
 temp_splits <- seq(min(summer_temp_dat), max(summer_temp_dat), length.out = 20)
+# N days: summer
+summer_data[, .N]
+
+# Winter data
+winter_data <- data[month < 5 | month > 9]
 winter_temp_dat <- -as.matrix(winter_data[, ..cols])
 w_temp_splits <- seq(min(winter_temp_dat), max(winter_temp_dat), length.out = 20)
-# N days: summer
-summer_data[,.N]
-# Range of lagged temperatures: summer
-round(range(summer_temp_dat), 2)
 # N days: winter
-winter_data[,.N]
-# Range of lagged temperatures: winter
-round(range(winter_temp_dat), 2)
+winter_data[, .N]
 ```
 
 ## Summer model
-Run all models on summer mortality/temperature data. We use 3 models: monotone TDLNM, TDLNM, and penalized spline DLNM (psDLNM). Control for month:year indicator and day of week to adjust for time trends in mortality.
+We model summer mortality and lagged temperature data using observations from May through September. For Monotone-TDLNM we use informative priors to incorporate knowledge from past research indicating high temperatures from up to 5 days prior may be related to increased mortality. Specifically, we assign a prior for lags 0-5 that we have 95% confidence the probability of an effect lies between 0.8 and 0.99. For the remaining lags we indicate with 95% confidence that the probability of an effect is between 0.01 and 0.8.
 
-### Monotone TDLNM
+### Monotone-TDLNM
 ```{r summer tdlnm monotone, cache=TRUE}
-g0 <- rep(-1.604, lags + 1) # prior prob .01-.8
-g0[1:6] <- 2.991 # prior prob 0.8-0.99 middle 95%
-s0 <- diag(lags + 1) * 1.526^2
+# g0 <- rep(0, lags + 1) # prior prob 0.025-0.975
+# g0[1:6] <- 2.991 # prior prob 0.8-0.99
+# s0 <- diag(lags + 1) * 1.869^2
+# for (s in 1:6)
+#   s0[s, s] <- 0.819^2
+g0 <- rep(0, lags + 1) # prior prob 0.005-0.995
+g0[1:6] <- 4.119 # prior prob 0.8-0.99
+s0 <- diag(lags + 1) * 2.701^2 
 for (s in 1:6)
-  s0[s, s] <- 0.819^2
+  s0[s, s] <- 0.599^2
 ts0 <- rep(1, lags)
-ts0[1:6] <- 10 # higher prob of split in first 6 lags
+ts0[1:6] <- 10
 ts0 <- ts0 / sum(ts0)
-
 mlist <- 
   foreach(m = 1:restarts, .errorhandling = "remove", 
          .packages = "dlmtree",
-         .export = c("summer_data", "summer_temp_dat", "temp_splits",
-                     "g0", "s0", "ts0"),
-         .verbose = FALSE) %dopar%
+         .verbose = FALSE) %dopar% 
+{
+  set.seed(m * 100)
   tdlnm(logdeath ~ as.factor(year) * as.factor(month) + as.factor(dow),
         data = summer_data,
         exposure.data = summer_temp_dat, 
         exposure.splits = temp_splits,
-        n.trees = 20, n.burn = 2000, n.iter = 5000, n.thin = 10,
-        monotone = TRUE, verbose = F,
-        monotone.gamma0 = g0, monotone.sigma = s0,
-        time.split.prob = ts0, monotone.time.kappa = 2)
-summer_deaths <- combine_models(mlist)
-s_summer_deaths <- summary(summer_deaths, cenval = 20, pred.at = 10:32)
+        n.trees = trees, n.burn = burn, n.iter = iter, n.thin = 10,
+        monotone = T, verbose = F, altmcmc = 1,
+        monotone.gamma0 = g0, monotone.sigma = s0, time.split.prob = ts0
+        )
+}
+summer_deaths <- combine.models(mlist)
+s_summer_deaths <- summary(summer_deaths, cenval = 20, pred.at = 10:32, 
+                           mcmc = TRUE, verbose = F)
 s_summer_deaths$matfit <- out_trans(s_summer_deaths$matfit)
 s_summer_deaths$cilower <- out_trans(s_summer_deaths$cilower)
 s_summer_deaths$ciupper <- out_trans(s_summer_deaths$ciupper)
+s_summer_deaths$plot.dat$Est <- out_trans(s_summer_deaths$plot.dat$Est)
+
+# Posterior prob of nonzero effect and time splits
 par(mfrow = c(1, 2))
-boxplot(1/(1+exp(-summer_deaths$zirtGamma)), ylim = c(0, 1), main = "Prob. nonzero ERC", names = 0:lags, cex = 0.5); points(1/(1+exp(-g0-1.96*sqrt(diag(s0)))), col = "red", pch = "-", cex = 3); points(1/(1+exp(-g0+1.96*sqrt(diag(s0)))), col = "red", pch = "-", cex = 3); 
+boxplot(1/(1+exp(-summer_deaths$zirtGamma)), ylim = c(0, 1), main = "Prob. nonzero ERC", names = 0:lags, cex = 0.5); points(1/(1+exp(-g0-1.96*sqrt(diag(s0)))), col = "red", pch = "-", cex = 3); points(1/(1+exp(-g0+1.96*sqrt(diag(s0)))), col = "red", pch = "-", cex = 3);
 boxplot(summer_deaths$timeProbs, ylim = c(0, 1), main = "Prob. time split", names = sapply(1:lags, function(i) paste0(i-1, "/", i)), cex = 0.5); points(ts0, col = "blue", pch = 16)
+
+# Linear model assumptions
+par(mfrow = c(1, 2))
+plot(summer_deaths$Yhat, main = "Summer: Monotone-TDLNM\nResidual vs Fitted",
+     summer_data$logdeath - summer_deaths$Yhat,
+     xlab = "Fitted", ylab = "Residuals"); abline(h = 0)
+qqnorm(scale(summer_data$logdeath - summer_deaths$Yhat, center = F), 
+       main = "\nNormal QQ Plot"); abline(0, 1)
+
+# Convergence
+s <- lapply(mlist, summary, cenval = -20, pred.at = 10:32, mcmc = TRUE, verbose = FALSE)
+summer_mcmc_mtdlnm <- do.call(mcmc.list, lapply(1:restarts, function(i) {
+  d <- as.data.frame.table(s[[i]]$dlm_mcmc)
+  d$Var1 <- paste0("Lag", rep(rep(0:lags, times = length(s[[i]]$pred.at)), times = iter/10))
+  d$Var2 <- paste0("Temp", rep(rep(s[[i]]$pred.at, each = length(0:lags)), times = iter/10))
+  setDT(d)
+  mcmc(dcast(d[Var2 != "Temp20"], Var3 ~ Var1 + Var2, value.var = "Freq")[, Var3 := NULL][])
+}))
+gr_summer_mtdlnm <- gelman.diag(summer_mcmc_mtdlnm, transform = F, autoburnin = F, multivariate = F)
 ```
 
-### Standard TDLNM
+
+
+
+### TDLNM
 ```{r summer tdlnm, cache=TRUE}
 mlist <- 
   foreach(m = 1:restarts, .errorhandling = "remove", 
          .packages = "dlmtree",
-         .export = c("summer_data", "summer_temp_dat", "temp_splits",
-                     "g0", "s0", "ts0"),
          .verbose = FALSE) %dopar%
+{
+  set.seed(m * 100)
   tdlnm(logdeath ~ as.factor(year) * as.factor(month) + as.factor(dow),
         data = summer_data,
         exposure.data = summer_temp_dat, 
-        exposure.splits = temp_splits,
-        n.trees = 20, n.burn = 2000, n.iter = 5000, n.thin = 10,
+        exposure.splits = temp_splits, 
+        n.burn = burn, n.iter = iter, n.thin = 10,
         verbose = F)
-summer_deaths2 <- combine_models(mlist)
-s_summer_deaths2 <- summary(summer_deaths2, cenval = 20, pred.at = 10:32)
+}
+summer_deaths2 <- combine.models(mlist)
+s_summer_deaths2 <- summary(summer_deaths2, cenval = 20, pred.at = 10:32, 
+                           mcmc = TRUE, verbose = F)
 s_summer_deaths2$matfit <- out_trans(s_summer_deaths2$matfit)
 s_summer_deaths2$cilower <- out_trans(s_summer_deaths2$cilower)
 s_summer_deaths2$ciupper <- out_trans(s_summer_deaths2$ciupper)
+s_summer_deaths2$plot.dat$Est <- out_trans(s_summer_deaths2$plot.dat$Est)
+
+# Linear model assumptions
+z <- model.matrix(~ as.factor(year) * as.factor(month) + as.factor(dow), summer_data)
+par(mfrow = c(1, 2))
+plot(summer_deaths2$Yhat, 
+     summer_data$logdeath - summer_deaths2$Yhat,
+     xlab = "Fitted", ylab = "Residuals"); abline(h = 0)
+qqnorm(scale(summer_data$logdeath - summer_deaths2$Yhat, center = F), main = ""); abline(0, 1)
+
+# Convergence
+s <- lapply(mlist, summary, cenval = -20, pred.at = 10:32, mcmc = TRUE, verbose = FALSE)
+summer_mcmc_tdlnm <- do.call(mcmc.list, lapply(1:restarts, function(i) {
+  d <- as.data.frame.table(s[[i]]$dlm_mcmc)
+  setDT(d)
+  d$Var1 <- paste0("Lag", rep(rep(0:lags, times = length(s[[i]]$pred.at)), times = iter/10))
+  d$Var2 <- paste0("Temp", rep(rep(s[[i]]$pred.at, each = length(0:lags)), times = iter/10))
+  mcmc(dcast(d[Var2 != "Temp20"], Var3 ~ Var1 + Var2, value.var = "Freq")[, Var3 := NULL][])
+}))
+gr_summer_tdlnm <- gelman.diag(summer_mcmc_tdlnm, transform = F, autoburnin = F, multivariate = F)
 ```
 
-### Penalized spline DLNM
+### GAM
 ```{r summer dlnm, cache=TRUE}
 cb <- crossbasis(summer_temp_dat, lag = c(0, lags),
                  argvar = list(fun = "ps", df = 10), 
@@ -159,6 +197,14 @@ cp_summer <- crosspred(cb, summer_deaths_gam, at = 10:32, bylag = 1, cen = 20)
 cp_summer$matfit <- out_trans(cp_summer$matfit)
 cp_summer$matlow <- out_trans(cp_summer$matlow)
 cp_summer$mathigh <- out_trans(cp_summer$mathigh)
+
+# Linear model assumptions
+par(mfrow = c(1, 2))
+plot(summer_deaths_gam$fitted.values, 
+     summer_data$logdeath - summer_deaths_gam$fitted.values,
+     xlab = "Fitted", ylab = "Residuals"); abline(h = 0)
+qqnorm(scale(summer_deaths_gam$residuals, center = F), main = ""); abline(0, 1)
+
 ```
 
 ### Lag days of susceptibility
@@ -323,67 +369,188 @@ ggplot(plot_dat, aes(x = temp, y = y, ymin = ymin, ymax = ymax)) +
   labs(x = "Temperature", y = "% Difference in Mortality")
 ```
 
+### Heat maps
+```{r}
+summer_plot_dat_gam <- s_summer_deaths$plot.dat
+summer_plot_dat_gam$Est <- c(cp_summer$matfit)
+summer_plot_dat <-
+  rbind.data.frame(cbind(s_summer_deaths$plot.dat, model = "Monotone-TDLNM"),
+      cbind(s_summer_deaths2$plot.dat, model = "TDLNM"),
+      cbind(summer_plot_dat_gam, model = "GAM"))
+summer_plot_dat$model <- factor(summer_plot_dat$model, levels = c("GAM", "TDLNM","Monotone-TDLNM"))
+ggplot(summer_plot_dat, 
+       aes(xmin = Tmin - 1, xmax = Tmax - 1,
+           ymin = Xmin, ymax = Xmax, fill = Est)) +
+      geom_rect() +
+  scale_fill_viridis_c() +
+      scale_y_continuous(expand = c(0, 0)) + scale_x_continuous(expand = c(0, 0)) +
+      theme_bw() +
+      facet_wrap(~model, nrow = 1) +
+  coord_equal(ratio = .65) +
+      labs(x = "Lag (days)", y = "Temperature", fill = "% Diff\nMortality", title = "")
+```
+
+
+### Convergence results
+#### Gelman-Rubin Statistic
+```{r convergence summer}
+# Effect
+summer_rows <- 
+  do.call(c, lapply(paste0("Lag", which(s_summer_deaths$splitProb > 0.95) - 1, "_"),
+                    function(x) { grep(x, rownames(gr_summer_mtdlnm$psrf))}))
+cv_summer <- data.frame("Monotone" = gr_summer_mtdlnm$psrf[summer_rows, 1],
+                        "TDLNM" = gr_summer_tdlnm$psrf[summer_rows, 1])
+cv_summer2 <- data.frame("Monotone" = gr_summer_mtdlnm$psrf[-summer_rows, 1],
+                         "TDLNM" = gr_summer_tdlnm$psrf[-summer_rows, 1])
+par(mfrow = c(1, 2))
+boxplot(cv_summer, ylim = c(1, 2), main = "Summer: Effect", ylab = "Rhat"); abline(h = 1.2, lty = 2)
+boxplot(cv_summer2, ylim = c(1, 2), main = "No Effect", ylab = "Rhat"); abline(h = 1.2, lty = 2)
+
+```
+
+#### Trace plots (Monotone-TDLNM)
+```{r}
+summer_trace <- rbind(
+  rbindlist(lapply(1:restarts, function(i) {
+  rbindlist(lapply(c(15, 40, 50, 375), function(j) {
+    data.table(name = colnames(summer_mcmc_mtdlnm[[i]])[j],
+               model = "Monotone-TDLNM",
+               chain = i,
+               draws = 1:nrow(summer_mcmc_mtdlnm[[i]]),
+               sample = summer_mcmc_mtdlnm[[i]][, j])
+  }))
+})),
+  rbindlist(lapply(1:restarts, function(i) {
+  rbindlist(lapply(c(15, 40, 50, 375), function(j) {
+    data.table(name = colnames(summer_mcmc_tdlnm[[i]])[j],
+               model = "TDLNM",
+               chain = i,
+               draws = 1:nrow(summer_mcmc_tdlnm[[i]]),
+               sample = summer_mcmc_tdlnm[[i]][, j])
+  }))
+}))
+)
+ggplot(summer_trace) +
+  geom_line(aes(x = draws, y = sample, color = factor(chain)), alpha = 0.25) +
+  geom_density(aes(y = sample), orientation = "y",
+               alpha = 0.2, bw = 0.001) +
+  facet_grid(model~name) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(x = "Draw", y = "Estimate")
+```
+
+
+
 
 
 
 ## Winter model
-We repeat the temperature-mortality model for winter days (October through April). We reverse the temperature axis to maintain monotone increasing for the monotone-TDLNM approach. All temperatures are represented as degrees below zero, where negative temperatures indicate degrees above zero.
+We repeat the temperature-mortality model for winter days spanning October through April. We reverse the temperature axis to maintain monotone increasing for the monotone-TDLNM approach. All temperatures are represented as degrees below zero, where negative temperatures indicate degrees above zero. To incorporate less prior knowledge of the relationship between mortality and lagged cold temperatures, we specify a prior in Monotone-TDLNM indicating 95% confidence for the probability of an effect at any lag between 0.05 and 0.95.
 
-### Monotone TDLNM
+### Monotone-TDLNM
 ```{r winter tdlnm monotone, cache=TRUE}
-g0 <- rep(0, lags + 1)#-2.298 + 2*2.298/(1+exp((-10:10)/2))
-s0 <- diag(lags + 1) * 1.502^2
-ts0 <- rep(1, lags + 1)
-ts0 <- ts0 / sum(ts0)
-
+g0 <- rep(0, lags + 1) # prior prob .025-.975
+s0 <- diag(lags + 1) * 2.701^2
+ts0 <- rep(1/lags, lags)
 mlist <- 
   foreach(m = 1:restarts, .errorhandling = "remove", 
          .packages = "dlmtree",
-         .export = c("winter_data", "winter_temp_dat", "w_temp_splits",
-                     "g0", "s0", "ts0"),
          .verbose = FALSE) %dopar%
+{
+  set.seed(m * 100)
   tdlnm(logdeath ~ as.factor(year) * as.factor(month) + as.factor(dow),
         data = winter_data,
         exposure.data = winter_temp_dat, 
         exposure.splits = w_temp_splits,
-        n.trees = 20, n.burn = 2000, n.iter = 5000, n.thin = 10,
-        monotone = TRUE, verbose = F,
-        monotone.gamma0 = g0, monotone.sigma = s0,
-        time.split.prob = ts0, monotone.time.kappa = 1)
+        n.trees = trees, n.burn = burn, n.iter = iter, n.thin = 10,
+        monotone.sigma = s0, altmcmc = 1,
+        monotone = T, verbose = F)
+}
 
-winter_deaths <- combine_models(mlist)
-s_winter_deaths <- summary(winter_deaths, cenval = -20, pred.at = -20:20)
+winter_deaths <- combine.models(mlist)
+s_winter_deaths <- summary(winter_deaths, cenval = -20, pred.at = -20:20, 
+                           mcmc = TRUE, verbose = F)
 s_winter_deaths$matfit <- out_trans(s_winter_deaths$matfit)
 s_winter_deaths$cilower <- out_trans(s_winter_deaths$cilower)
 s_winter_deaths$ciupper <- out_trans(s_winter_deaths$ciupper)
+s_winter_deaths$plot.dat$Est <- out_trans(s_winter_deaths$plot.dat$Est)
+
 par(mfrow = c(1, 2))
-boxplot(1/(1+exp(-winter_deaths$zirtGamma)), ylim = c(0, 1), main = "Prob. nonzero ERC", names = 0:lags); points(1/(1+exp(-g0-1.96*sqrt(diag(s0)))), col = "red", pch = "-", cex = 3); points(1/(1+exp(-g0+1.96*sqrt(diag(s0)))), col = "red", pch = "-", cex = 3); 
-boxplot(winter_deaths$timeProbs, ylim = c(0, 1), main = "Prob. time split", names = sapply(1:lags, function(i) paste0(i-1, "/", i))); points(ts0, col = "blue", pch = 16)
+boxplot(1/(1+exp(-winter_deaths$zirtGamma)), 
+        ylim = c(0, 1), main = "Prob. nonzero ERC", names = 0:lags); 
+points(1/(1+exp(-g0-1.96*sqrt(diag(s0)))), col = "red", pch = "-", cex = 3); 
+points(1/(1+exp(-g0+1.96*sqrt(diag(s0)))), col = "red", pch = "-", cex = 3);
+boxplot(winter_deaths$timeProbs, ylim = c(0, 1), 
+        main = "Prob. time split", 
+        names = sapply(1:lags, function(i) paste0(i-1, "/", i))); 
+points(ts0, col = "blue", pch = 16)
+
+
+# Linear model assumptions
+par(mfrow = c(1, 2))
+plot(winter_deaths$Yhat, 
+     winter_data$logdeath - winter_deaths$Yhat,
+     main = "Winter: Monotone-TDLNM\nResidual vs Fitted",
+     xlab = "Fitted", ylab = "Residuals"); abline(h = 0)
+qqnorm(scale(winter_data$logdeath - winter_deaths$Yhat, center = F), 
+       main = "\nNormal QQ Plot"); abline(0, 1)
+
+# Convergence
+s <- lapply(mlist, summary, cenval = -20, pred.at = 10:32, mcmc = TRUE, verbose = FALSE)
+winter_mcmc_mtdlnm <- do.call(mcmc.list, lapply(1:restarts, function(i) {
+  d <- as.data.frame.table(s[[i]]$dlm_mcmc)
+  setDT(d)
+  d$Var1 <- paste0("Lag", rep(rep(0:lags, times = length(s[[i]]$pred.at)), times = iter/10))
+  d$Var2 <- paste0("Temp", rep(rep(s[[i]]$pred.at, each = length(0:lags)), times = iter/10))
+  mcmc(dcast(d[Var2 != "Temp20"], Var3 ~ Var1 + Var2, value.var = "Freq")[, Var3 := NULL][])
+}))
+gr_winter_mtdlnm <- gelman.diag(winter_mcmc_mtdlnm, transform = F, autoburnin = F, multivariate = F)
 ```
 
-### Standard TDLNM
+### TDLNM
 ```{r winter tdlnm, cache=TRUE}
 mlist <- 
   foreach(m = 1:restarts, .errorhandling = "remove", 
          .packages = "dlmtree",
-         .export = c("winter_data", "winter_temp_dat", "w_temp_splits",
-                     "g0", "s0", "ts0"),
          .verbose = FALSE) %dopar%
+{
+  set.seed(m * 100)
   tdlnm(logdeath ~ as.factor(year) * as.factor(month) + as.factor(dow),
         data = winter_data,
         exposure.data = winter_temp_dat, 
-        exposure.splits = w_temp_splits,
-        n.trees = 20, n.burn = 2000, n.iter = 5000, n.thin = 10,
+        exposure.splits = w_temp_splits, 
+        n.burn = burn, n.iter = iter, n.thin = 10,
         verbose = F)
-winter_deaths2 <- combine_models(mlist)
-s_winter_deaths2 <- summary(winter_deaths2, cenval = -20, pred.at = -20:20)
+}
+winter_deaths2 <- combine.models(mlist)
+s_winter_deaths2 <- summary(winter_deaths2, cenval = -20, pred.at = -20:20, 
+                           mcmc = TRUE, verbose = F)
 s_winter_deaths2$matfit <- out_trans(s_winter_deaths2$matfit)
 s_winter_deaths2$cilower <- out_trans(s_winter_deaths2$cilower)
 s_winter_deaths2$ciupper <- out_trans(s_winter_deaths2$ciupper)
-stopCluster(cl)
+s_winter_deaths2$plot.dat$Est <- out_trans(s_winter_deaths2$plot.dat$Est)
+
+# Linear model assumptions
+par(mfrow = c(1, 2))
+plot(winter_deaths2$Yhat, 
+     winter_data$logdeath - winter_deaths2$Yhat,
+     xlab = "Fitted", ylab = "Residuals"); abline(h = 0)
+qqnorm(scale(winter_data$logdeath - winter_deaths2$Yhat, center = F), main = ""); abline(0, 1)
+
+# Convergence
+s <- lapply(mlist, summary, cenval = -20, pred.at = 10:32, mcmc = TRUE, verbose = FALSE)
+winter_mcmc_tdlnm <- do.call(mcmc.list, lapply(1:restarts, function(i) {
+  d <- as.data.frame.table(s[[i]]$dlm_mcmc)
+  setDT(d)
+  d$Var1 <- paste0("Lag", rep(rep(0:lags, times = length(s[[i]]$pred.at)), times = iter/10))
+  d$Var2 <- paste0("Temp", rep(rep(s[[i]]$pred.at, each = length(0:lags)), times = iter/10))
+  mcmc(dcast(d[Var2 != "Temp20"], Var3 ~ Var1 + Var2, value.var = "Freq")[, Var3 := NULL][])
+}))
+gr_winter_tdlnm <- gelman.diag(winter_mcmc_tdlnm, transform = F, autoburnin = F, multivariate = F)
 ```
 
-### Penalized spline DLNM
+### GAM
 ```{r winter dlnm, cache=TRUE}
 cb <- crossbasis(winter_temp_dat, lag = c(0, lags),
                  argvar = list(fun = "ps", df = 10), 
@@ -395,6 +562,14 @@ cp_winter <- crosspred(cb, winter_deaths_gam, at = -20:20, bylag = 1, cen = -20)
 cp_winter$matfit <- out_trans(cp_winter$matfit)
 cp_winter$matlow <- out_trans(cp_winter$matlow)
 cp_winter$mathigh <- out_trans(cp_winter$mathigh)
+
+# Linear model assumptions
+par(mfrow = c(1, 2))
+plot(winter_deaths_gam$fitted.values, 
+     winter_data$logdeath - winter_deaths_gam$fitted.values,
+     xlab = "Fitted", ylab = "Residuals"); abline(h = 0)
+qqnorm(scale(winter_deaths_gam$residuals, center = F), main = ""); abline(0, 1)
+
 ```
 
 ### Lag days of susceptibility
@@ -556,7 +731,83 @@ ggplot(plot_dat, aes(x = temp, y = y, ymin = ymin, ymax = ymax)) +
   labs(x = "Degrees below zero", y = "% Difference in Mortality")
 ```
 
-```{r prob effect, include=FALSE}
+
+
+### Heat maps
+```{r}
+winter_plot_dat_gam <- s_winter_deaths$plot.dat
+winter_plot_dat_gam$Est <- c(cp_winter$matfit)
+winter_plot_dat <-
+  rbind.data.frame(cbind(s_winter_deaths$plot.dat, model = "Monotone-TDLNM"),
+      cbind(s_winter_deaths2$plot.dat, model = "TDLNM"),
+      cbind(winter_plot_dat_gam, model = "GAM"))
+winter_plot_dat$model <- factor(winter_plot_dat$model, levels = c("GAM", "TDLNM","Monotone-TDLNM"))
+ggplot(winter_plot_dat, 
+       aes(xmin = Tmin - 1, xmax = Tmax - 1,
+           ymin = Xmin, ymax = Xmax, fill = Est)) +
+      geom_rect() +
+  scale_fill_viridis_c() +
+      scale_y_continuous(expand = c(0, 0)) + scale_x_continuous(expand = c(0, 0)) +
+      theme_bw() +
+      facet_wrap(~model, nrow = 1) +
+  coord_equal(ratio = .4) +
+      labs(x = "Lag (days)", y = "Degrees below zero", fill = "% Diff\nMortality", title = "")
+```
+
+
+
+### Convergence results
+#### Gelman-Rubin Statistic
+```{r convergence winter}
+# Effect
+winter_rows <- 
+  do.call(c, lapply(paste0("Lag", which(s_winter_deaths$splitProb > 0.9) - 1, "_"),
+                    function(x) { grep(x, rownames(gr_winter_mtdlnm$psrf))}))
+cv_winter <- data.frame("Monotone" = gr_winter_mtdlnm$psrf[winter_rows, 1],
+                        "TDLNM" = gr_winter_tdlnm$psrf[winter_rows, 1])
+cv_winter2 <- data.frame("Monotone" = gr_winter_mtdlnm$psrf[-winter_rows, 1],
+                         "TDLNM" = gr_winter_tdlnm$psrf[-winter_rows, 1])
+par(mfrow = c(1, 2))
+boxplot(cv_winter, ylim = c(1, 2), main = "Winter: Effect", ylab = "Rhat"); abline(h = 1.2, lty = 2)
+boxplot(cv_winter2, ylim = c(1, 2), main = "No Effect", ylab = "Rhat"); abline(h = 1.2, lty = 2)
+
+```
+
+#### Trace plots (Monotone-TDLNM)
+```{r}
+winter_trace <- rbind(
+  rbindlist(lapply(1:restarts, function(i) {
+  rbindlist(lapply(c(20, 230, 275, 175), function(j) {
+    data.table(name = colnames(winter_mcmc_mtdlnm[[i]])[j],
+               model = "Monotone-TDLNM",
+               chain = i,
+               draws = 1:nrow(winter_mcmc_mtdlnm[[i]]),
+               sample = winter_mcmc_mtdlnm[[i]][, j])
+  }))
+})),
+  rbindlist(lapply(1:restarts, function(i) {
+  rbindlist(lapply(c(20, 230, 275, 175), function(j) {
+    data.table(name = colnames(winter_mcmc_tdlnm[[i]])[j],
+               model = "TDLNM",
+               chain = i,
+               draws = 1:nrow(winter_mcmc_tdlnm[[i]]),
+               sample = winter_mcmc_tdlnm[[i]][, j])
+  }))
+}))
+)
+ggplot(winter_trace) +
+  geom_line(aes(x = draws, y = sample, color = factor(chain)), alpha = 0.25) +
+  geom_density(aes(y = sample), orientation = "y",
+               alpha = 0.2, bw = 0.001) +
+  facet_grid(model~name) +
+  theme_minimal() +
+  theme(legend.position = "none") +
+  labs(x = "Draw", y = "Estimate")
+```
+
+
+## Probability of effect
+```{r prob effect}
 plot_dat_pe <- rbind.data.frame(
   data.frame(lag = 0:lags, prob = s_summer_deaths$splitProb, group = "Summer"),
   data.frame(lag = 0:lags, prob = s_winter_deaths$splitProb, group = "Winter")
@@ -566,7 +817,152 @@ ggplot(plot_dat_pe, aes(x = lag, y = prob, color = group, linetype = group)) +
   geom_line(size = 2) +
   theme_bw(base_size = 16) +
   scale_y_continuous(limits = c(0, 1)) +
+  scale_x_continuous(expand = c(0, 0)) +
   labs(x = "Lag (days)", y = "P(susceptibility at lag l)", color = "", linetype = "") +
   theme(legend.position = "bottom", legend.key.width = unit(2, "cm"))
 ```
 
+
+## Convergence results
+```{r convergence}
+cv_summer <- data.frame("Monotone" = gr_summer_mtdlnm$psrf[, 1],
+                        "TDLNM" = gr_summer_tdlnm$psrf[, 1])
+cv_winter <- data.frame("Monotone" = gr_winter_mtdlnm$psrf[, 1],
+                        "TDLNM" = gr_winter_tdlnm$psrf[, 1])
+par(mfrow = c(1, 2))
+boxplot(cv_summer, ylim = c(1, 2), main = "Gelman-Rubin Statistic:\nSummer", ylab = "Rhat"); abline(h = 1.2, lty = 2)
+boxplot(cv_winter2, ylim = c(1, 2), main = "\nWinter", ylab = "Rhat"); abline(h = 1.2, lty = 2)
+```
+
+
+
+
+## Sensitivity analyses
+In a sensitivity analysis for our summer mortality dataset, we rerun Monotone-TDLNM but with the vague prior used in the winter mortality analysis.
+
+### Summer: Monotone-TDLNM, vague prior
+```{r summer tdlnm monotone vague prior, cache=TRUE}
+s0 <- diag(lags + 1) * 2.701^2
+mlist <- 
+  foreach(m = 1:restarts, .errorhandling = "remove",  
+         .packages = "dlmtree",
+         .verbose = FALSE) %dopar%
+{
+  set.seed(m * 100)
+  tdlnm(logdeath ~ as.factor(year) * as.factor(month) + as.factor(dow),
+        data = summer_data,
+        exposure.data = summer_temp_dat, 
+        exposure.splits = temp_splits,
+        n.trees = trees, n.burn = burn, n.iter = iter, n.thin = 10,
+        monotone.sigma = s0, altmcmc = 1,
+        monotone = T, verbose = F)
+}
+stopCluster(cl)
+summer_deaths0 <- combine.models(mlist)
+s_summer_deaths0 <- summary(summer_deaths0, cenval = 20, pred.at = 10:32, 
+                           mcmc = TRUE, verbose = F)
+s_summer_deaths0$matfit <- out_trans(s_summer_deaths0$matfit)
+s_summer_deaths0$cilower <- out_trans(s_summer_deaths0$cilower)
+s_summer_deaths0$ciupper <- out_trans(s_summer_deaths0$ciupper)
+s_summer_deaths0$plot.dat$Est <- out_trans(s_summer_deaths0$plot.dat$Est)
+```
+
+```{r}
+plot(0:lags, s_summer_deaths0$splitProb, main = "Monotone-TDLNM: Posterior inference", type = 'l', xlab = "Lag", ylab = "Prob of effect", ylim = c(0, 1)); abline(h = 0.95, col = "red", lty = 2)
+
+plot_dat <- rbind.data.frame(
+  data.frame(lag = 0:lags, 
+             y = s_summer_deaths$matfit["25",],
+             ymin = s_summer_deaths$cilower["25",],
+             ymax = s_summer_deaths$ciupper["25",],
+             grp = "25 deg C",
+             model = "Monotone-TDLNM"),
+  data.frame(lag = 0:lags, 
+             y = s_summer_deaths$matfit["28",],
+             ymin = s_summer_deaths$cilower["28",],
+             ymax = s_summer_deaths$ciupper["28",],
+             grp = "28 deg C",
+             model = "Monotone-TDLNM"),
+  data.frame(lag = 0:lags, 
+             y = s_summer_deaths$matfit["32",],
+             ymin = s_summer_deaths$cilower["32",],
+             ymax = s_summer_deaths$ciupper["32",],
+             grp = "32 deg C",
+             model = "Monotone-TDLNM"),
+  data.frame(lag = 0:lags, 
+             y = s_summer_deaths0$matfit["25",],
+             ymin = s_summer_deaths0$cilower["25",],
+             ymax = s_summer_deaths0$ciupper["25",],
+             grp = "25 deg C",
+             model = "Uninformative prior"),
+  data.frame(lag = 0:lags, 
+             y = s_summer_deaths0$matfit["28",],
+             ymin = s_summer_deaths0$cilower["28",],
+             ymax = s_summer_deaths0$ciupper["28",],
+             grp = "28 deg C",
+             model = "Uninformative prior"),
+  data.frame(lag = 0:lags, 
+             y = s_summer_deaths0$matfit["32",],
+             ymin = s_summer_deaths0$cilower["32",],
+             ymax = s_summer_deaths0$ciupper["32",],
+             grp = "32 deg C",
+             model = "Uninformative prior")
+)
+
+ggplot(plot_dat, aes(x = lag, y = y, ymin = ymin, ymax = ymax)) +
+  geom_hline(yintercept = 0, color = "red") +
+  geom_ribbon(fill = "grey") +
+  geom_line(size = 1) +
+  facet_grid(model ~ grp) +
+  theme_bw(base_size = 16) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(x = "Lag (days)", y = "% Difference in Mortality")
+
+plot_dat <- rbind.data.frame(
+  data.frame(temp = s_summer_deaths$pred.at, 
+             y = s_summer_deaths$matfit[,2],
+             ymin = s_summer_deaths$cilower[,2],
+             ymax = s_summer_deaths$ciupper[,2],
+             grp = "1 day prior",
+             model = "Monotone-TDLNM"),
+  data.frame(temp = s_summer_deaths$pred.at, 
+             y = s_summer_deaths$matfit[,3],
+             ymin = s_summer_deaths$cilower[,3],
+             ymax = s_summer_deaths$ciupper[,3],
+             grp = "2 days prior",
+             model = "Monotone-TDLNM"),
+  data.frame(temp = s_summer_deaths$pred.at, 
+             y = s_summer_deaths$matfit[,6],
+             ymin = s_summer_deaths$cilower[,6],
+             ymax = s_summer_deaths$ciupper[,6],
+             grp = "5 days prior",
+             model = "Monotone-TDLNM"),
+  
+  data.frame(temp = s_summer_deaths0$pred.at, 
+             y = s_summer_deaths0$matfit[,2],
+             ymin = s_summer_deaths0$cilower[,2],
+             ymax = s_summer_deaths0$ciupper[,2],
+             grp = "1 day prior",
+             model = "Uninformative prior"),
+  data.frame(temp = s_summer_deaths0$pred.at, 
+             y = s_summer_deaths0$matfit[,3],
+             ymin = s_summer_deaths0$cilower[,3],
+             ymax = s_summer_deaths0$ciupper[,3],
+             grp = "2 days prior",
+             model = "Uninformative prior"),
+  data.frame(temp = s_summer_deaths0$pred.at, 
+             y = s_summer_deaths0$matfit[,6],
+             ymin = s_summer_deaths0$cilower[,6],
+             ymax = s_summer_deaths0$ciupper[,6],
+             grp = "5 days prior",
+             model = "Uninformative prior")
+)
+ggplot(plot_dat, aes(x = temp, y = y, ymin = ymin, ymax = ymax)) +
+  geom_hline(yintercept = 0, color = "red") +
+  geom_ribbon(fill = "grey") +
+  geom_line(size = 1) +
+  facet_grid(model ~ grp) +
+  theme_bw(base_size = 16) +
+  scale_x_continuous(expand = c(0, 0)) +
+  labs(x = "Temperature", y = "% Difference in Mortality")
+```
